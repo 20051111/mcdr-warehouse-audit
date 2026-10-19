@@ -34,7 +34,7 @@
 
 PLUGIN_METADATA = {
 	'id': 'warehouse_audit',
-	'version': '1.0.0',
+	'version': '1.0.1',
 	'name': '仓库审计日志 (WarehouseAuditLog)',
 	'description': {
 		'en_us': 'Audit warehouse container interactions (player/time/item/count/coords) into SQLite with async batched writes, export CSV via !!wh export',
@@ -748,6 +748,22 @@ class WarehouseAudit:
 
 	# ------------------------------------------------------------------ 轮询
 
+	def _rcon_query(self, cmd: str) -> Optional[str]:
+		"""带护栏的 rcon_query: 查询前后再校验 RCON 状态, 异常返回 None。
+
+		服务端关闭瞬间 MCDR 的 RCON 连接对象可能仍处于"已连接"状态,
+		此时查询会触发 MCDR 内部 3 次重试 (Bad file descriptor 日志)。
+		这里在查询前后各做一次状态检查, 尽量避免在服务端死亡时触发查询。
+		"""
+		if self._stop_event.is_set():
+			return None
+		try:
+			if not self.server.is_rcon_running():
+				return None
+			return self.server.rcon_query(cmd)
+		except Exception:
+			return None
+
 	def _poll_loop(self) -> None:
 		"""轮询线程主循环: 枚举 -> 读玩家 -> 读容器 -> diff -> 合并 -> 入队。"""
 		server = self.server
@@ -793,9 +809,12 @@ class WarehouseAudit:
 				self.players = {}
 			return
 		positions = parse_player_positions(
-			self.server.rcon_query('execute as @a run data get entity @s Pos'))
+			self._rcon_query('execute as @a run data get entity @s Pos'))
+		if positions is None:
+			# RCON 断开 (服务端死亡瞬间): 跳过本轮
+			return
 		dimensions = parse_player_dimensions(
-			self.server.rcon_query('execute as @a run data get entity @s Dimension'))
+			self._rcon_query('execute as @a run data get entity @s Dimension'))
 		players: Dict[str, Tuple[Optional[str], float, float, float]] = {}
 		for name, (x, y, z) in positions.items():
 			players[name] = (dimensions.get(name), x, y, z)
@@ -816,8 +835,12 @@ class WarehouseAudit:
 		prune_threshold = int(self.config.get('prune_after_misses', 600))
 		for pos, block_id in containers.items():
 			x, y, z = pos
-			status, items = parse_block_items_response(
-				self.server.rcon_query('data get block {} {} {} Items'.format(x, y, z)), pos)
+			resp = self._rcon_query('data get block {} {} {} Items'.format(x, y, z))
+			if resp is None:
+				# RCON 断开 (服务端死亡瞬间): 中止本轮, 避免对每个容器重复触发
+				# MCDR 内部的 3 次重试 (Bad file descriptor 刷屏)
+				break
+			status, items = parse_block_items_response(resp, pos)
 			if status == READ_SKIP:
 				# 未加载或读取失败: 保留旧快照 (未加载区块内不可能发生变化)
 				if pos in old_snapshots:
@@ -1201,7 +1224,7 @@ class WarehouseAudit:
 		found: Dict[Tuple[int, int, int], str] = {}
 		verified_absent: Set[Tuple[int, int, int]] = set()
 		unloaded = 0
-		query = self.server.rcon_query
+		query = self._rcon_query
 		for region in regions:
 			bounds = self._normalize_bounds(region)
 			if not bounds:
@@ -1210,10 +1233,12 @@ class WarehouseAudit:
 			for x in range(lo[0], hi[0] + 1):
 				for y in range(lo[1], hi[1] + 1):
 					for z in range(lo[2], hi[2] + 1):
-						if self._stop_event.is_set():
+						if self._stop_event.is_set() or not self.server.is_rcon_running():
+							# 停止或 RCON 断开: 中止扫描 (避免 Bad file descriptor 刷屏)
 							return found, verified_absent, unloaded
 						resp = query('data get block {} {} {} id'.format(x, y, z))
 						if resp is None:
+							unloaded += 1
 							continue
 						text = resp.strip()
 						if ERR_NOT_LOADED in text:
@@ -1625,12 +1650,19 @@ def on_load(server: PluginServerInterface, prev_module) -> None:
 	# 不会自动调用模块级 register(); 必须在此显式注册指令
 	register(server)
 	# 初始枚举: 等待服务器与 RCON 就绪后在后台线程执行
+	# 注意: 必须先捕获本实例引用, 否则插件卸载后全局 audit=None 会让线程崩溃
+	audit_ref = audit
+
 	def initial_scan():
-		while not audit._stop_event.is_set():
+		while audit_ref is not None and not audit_ref._stop_event.is_set():
 			if server.is_server_running() and server.is_rcon_running():
-				audit.rescan_containers()
+				try:
+					audit_ref.rescan_containers()
+				except Exception:
+					server.logger.error('WarehouseAudit initial scan failed:\n{}'.format(traceback.format_exc()))
 				return
 			time.sleep(1.0)
+
 	threading.Thread(target=initial_scan, name='WarehouseAudit-InitScan', daemon=True).start()
 
 

@@ -1,5 +1,20 @@
 # 更新日志
 
+## v1.0.1 (2026-10-19)
+
+### 修复
+- **插件卸载线程崩溃**：初始枚举线程读取模块级全局 `audit`，插件卸载后读到 `None`
+  抛出 `AttributeError: 'NoneType' object has no attribute '_stop_event'`。
+  现在线程持有实例引用，卸载后安全退出。
+- **服务端关闭时 RCON 报错刷屏**：服务端死亡瞬间 MCDR 的 RCON 连接对象仍处于
+  "已连接"状态，轮询对每个容器发查询都触发 MCDR 内部 3 次重试
+  （`Rcon fail to receive packet: [Errno 9] Bad file descriptor`）。
+  新增带护栏的 `_rcon_query()`：查询前后校验 RCON 状态、异常返回 None、
+  读容器遇到断开立即中止本轮，不再对剩余容器重复触发查询。
+
+### 其他
+- 部署目标扩展至生存服（1.20.4生存服，RCON 端口 25576）
+
 ## v1.0.0 (2026-10-18)
 
 首个发布版本。

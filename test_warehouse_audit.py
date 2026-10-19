@@ -625,6 +625,37 @@ class TestLifecycle(unittest.TestCase):
 		wa.audit = self._prev_audit
 		self.tmp.cleanup()
 
+	def test_initial_scan_thread_survives_unload(self):
+		"""初始枚举线程在插件卸载 (audit=None) 后不崩溃 (AttributeError 回归)。"""
+		with tempfile.TemporaryDirectory() as tmp:
+			server = FakeServer(tmp)
+			wa.audit = self._prev_audit  # 恢复全局供 on_load 使用
+			wa.on_load(server, None)  # 启动 initial_scan 线程
+			# 模拟插件卸载: on_unload 把全局 audit 置 None
+			wa.on_unload(server)
+			# 线程应安全退出 (等待 2.5s, 无 AttributeError 即通过)
+			time.sleep(2.5)
+			wa.on_load(server, None)
+			wa.on_unload(server)
+
+	def test_rcon_query_guard(self):
+		"""RCON 断开/异常时 _rcon_query 返回 None 而非抛异常 (Bad file descriptor 回归)。"""
+		# 服务端关闭 -> is_rcon_running False -> None
+		self.server.rcon_responses = {}
+		self.assertIsNone(self.audit._rcon_query('list'))
+		# rcon_query 抛异常 -> None
+		class _Boom:
+			def is_rcon_running(self):
+				return True
+			def rcon_query(self, cmd):
+				raise OSError(9, 'Bad file descriptor')
+		orig = self.audit.server
+		self.audit.server = _Boom()
+		try:
+			self.assertIsNone(self.audit._rcon_query('list'))
+		finally:
+			self.audit.server = orig
+
 	def test_rebaseline_flushes_and_clears(self):
 		# 挂起记录 + 旧快照
 		rec = ('t', 1000.0, '主仓库', 'minecraft:overworld', 4, 100, 9,
