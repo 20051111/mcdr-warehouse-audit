@@ -692,6 +692,9 @@ class WarehouseAudit:
 		# 响应哈希缓存 (1.20.5+ 大响应性能优化: 哈希未变跳过解析)
 		self._resp_hashes: Dict[Tuple[int, int, int], int] = {}
 		self._resp_hash_lock = threading.Lock()
+		# 轮转分批游标 (大仓库保护: 每周期只查一批)
+		self._poll_batch_cursor = 0
+		self._poll_batch_lock = threading.Lock()
 		# 容器列表锁定 (lock_containers=true 时首次枚举后密封)
 		self._containers_sealed = False
 		# 匿名编号映射: player name -> 编号 (anon mode)
@@ -912,19 +915,35 @@ class WarehouseAudit:
 			with parse_lock:
 				parse_results[pos] = (status, items)
 
+		# 轮转分批 (大仓库保护): 容器数超过单批上限时, 每周期只查一批,
+		# 轮转覆盖全部 —— 每批 60 个容器 x ~40ms = 2.4s, TPS 不至于垮
+		# (1832 容器 = 每 31 个周期轮完一遍, 检测延迟最多 ~5 分钟)
+		batch_limit = int(self.config.get('poll_batch_size', 60))
+		items_list = list(containers.items())
+		if len(items_list) > batch_limit:
+			with self._poll_batch_lock:
+				start = self._poll_batch_cursor % len(items_list)
+				self._poll_batch_cursor = (start + batch_limit) % len(items_list)
+			batch = items_list[start:start + batch_limit] + \
+				items_list[:max(0, start + batch_limit - len(items_list))]
+		else:
+			batch = items_list
 		# 拉取+解析在多个工作线程并行 (RCON 内部有锁串行化, 解析并行)
 		from concurrent.futures import ThreadPoolExecutor
 		workers = max(2, min(4, (os.cpu_count() or 2)))
 		with ThreadPoolExecutor(max_workers=workers, thread_name_prefix='WarehouseAudit-Parse') as pool:
-			futures = [pool.submit(fetch_and_parse, pos, bid) for pos, bid in containers.items()]
+			futures = [pool.submit(fetch_and_parse, pos, bid) for pos, bid in batch]
 			for f in futures:
 				f.result()
 		if parse_error['abort']:
 			# RCON 断开: 本轮中止 (快照不变, 下轮重新基线)
 			return
-		for pos, block_id in containers.items():
+		for pos, block_id in batch:
 			result = parse_results.get(pos)
 			if result is None:
+				# 本批未查到的容器 (轮转分批模式): 保留旧快照与 miss 计数
+				if pos in old_snapshots:
+					new_snapshots[pos] = old_snapshots[pos]
 				continue
 			status, items = result
 			if status == 'unchanged':
