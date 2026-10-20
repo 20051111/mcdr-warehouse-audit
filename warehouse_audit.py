@@ -34,7 +34,7 @@
 
 PLUGIN_METADATA = {
 	'id': 'warehouse_audit',
-	'version': '1.0.2',
+	'version': '1.0.3',
 	'name': '仓库审计日志 (WarehouseAuditLog)',
 	'description': {
 		'en_us': 'Audit warehouse container interactions (player/time/item/count/coords) into SQLite with async batched writes, export CSV via !!wh export',
@@ -73,8 +73,15 @@ from mcdreforged.api.rtext import *
 COMMAND_PREFIX = '!!wh'
 
 #: `data get block X Y Z <path>` 成功时的输出 (注意坐标之间是逗号+空格)
+#: 兼容 1.13~1.20.4 的 "X, Y, Z has the following block data: ...";
+#: 新版本若改措辞, 回退到宽松匹配 (坐标 + 冒号 + 任意内容)
 BLOCK_DATA_RE = re.compile(
 	r'^(-?\d+), (-?\d+), (-?\d+) has the following block data: (.*)$',
+	re.DOTALL
+)
+#: 宽松兜底: 新版本改措辞时匹配 "坐标 + 任意分隔 + 数据" (取行内最后一个冒号分隔)
+BLOCK_DATA_RE_LOOSE = re.compile(
+	r'^(-?\d+),\s*(-?\d+),\s*(-?\d+)\b[^:]*:\s*(.*)$',
 	re.DOTALL
 )
 #: `execute as @a run data get entity @s Pos` 的每玩家输出 (多名玩家拼接在同一字符串中)
@@ -538,7 +545,7 @@ def parse_block_items_response(response: Optional[str], pos: Tuple[int, int, int
 	if ERR_PATH_NOT_FOUND in text:
 		# 该方块实体没有 Items 标签 (如空潜影盒) -> 视为空容器
 		return READ_OK, {}
-	m = BLOCK_DATA_RE.match(text)
+	m = BLOCK_DATA_RE.match(text) or BLOCK_DATA_RE_LOOSE.match(text)
 	if not m:
 		return READ_SKIP, None
 	if (int(m.group(1)), int(m.group(2)), int(m.group(3))) != pos:
@@ -566,7 +573,8 @@ def parse_block_items_response(response: Optional[str], pos: Tuple[int, int, int
 	for entry in items:
 		if not isinstance(entry, dict):
 			continue
-		item_id = entry.get('id')
+		# 1.20.4: id / 1.20.5+: item (组件化)
+		item_id = entry.get('id') or entry.get('item')
 		if not isinstance(item_id, str):
 			continue
 		try:
@@ -1265,7 +1273,9 @@ class WarehouseAudit:
 			return -1
 		try:
 			count = self._rescan_containers_impl(source)
-			if count >= 0 and bool(self.config.get('lock_containers', False)):
+			# 大区域防护: 枚举失败 (返回 -1) 或发现 0 容器时不密封,
+			# 允许下轮重试 —— 避免大区域首次枚举超时/失败后锁死空列表
+			if count > 0 and bool(self.config.get('lock_containers', False)):
 				with self._state_lock:
 					self._containers_sealed = True
 			return count
@@ -1293,6 +1303,13 @@ class WarehouseAudit:
 				total_volume += (hi[0] - lo[0] + 1) * (hi[1] - lo[1] + 1) * (hi[2] - lo[2] + 1)
 		use_rcon = method == 'rcon_scan' or (
 			method == 'auto' and total_volume <= int(self.config.get('rcon_scan_max_blocks', 10000)))
+		# 大区域防护: RCON 逐块扫描超预算 (30 万块 = 60 秒, 占用 MCDR rcon 锁)
+		# -> 自动切换区域文件解析 (不占 RCON, 不依赖区块加载)
+		if use_rcon and total_volume > 50000:
+			self.server.logger.warning(
+				'WarehouseAudit: region volume {} too large for RCON scan, '
+				'falling back to region-file parse'.format(total_volume))
+			use_rcon = False
 
 		if use_rcon and self.server.is_rcon_running():
 			rcon_found, verified_absent, unloaded = self._rcon_scan(regions, container_ids)
@@ -1319,6 +1336,12 @@ class WarehouseAudit:
 				# 扫描一无所获但之前有容器: 可能是世界目录错误/IO 故障, 保留旧列表
 				self.server.logger.warning(
 					'WarehouseAudit: rescan found 0 containers but had {} before; keeping old list'.format(previous_count))
+			elif not found and previous_count == 0:
+				# 大区域防护: 枚举失败 (0 容器) - 不密封, 允许下轮重试
+				# (world_dir 推断失败/RCON 超时/region file 读取失败都会走到这里)
+				self.server.logger.warning(
+					'WarehouseAudit: rescan found 0 containers in {} block(s); '
+					'will retry (check world_directory config if this persists)'.format(total_volume))
 			else:
 				self.containers = dict(found)
 				self.region_of = {}
@@ -1380,7 +1403,7 @@ class WarehouseAudit:
 						if ERR_NOT_BLOCK_ENTITY in text:
 							verified_absent.add(pos)
 							continue
-						m = BLOCK_DATA_RE.match(text)
+						m = BLOCK_DATA_RE.match(text) or BLOCK_DATA_RE_LOOSE.match(text)
 						if not m or (int(m.group(1)), int(m.group(2)), int(m.group(3))) != pos:
 							continue
 						try:

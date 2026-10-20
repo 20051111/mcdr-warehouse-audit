@@ -678,18 +678,37 @@ class TestLifecycle(unittest.TestCase):
 	def test_lock_containers(self):
 		"""容器锁定: 首次枚举后周期性 rescan 跳过, 手动 rescan (带 source) 仍可强制。"""
 		self.audit.config['lock_containers'] = True
-		# 首次手动枚举 -> 锁定
-		cnt = self.audit.rescan_containers(FakeSource())
-		self.assertGreaterEqual(cnt, 0)
-		self.assertTrue(self.audit._containers_sealed)
-		# 周期性 rescan (source=None) -> 跳过, 不改变容器
-		before = dict(self.audit.containers)
-		self.audit.rescan_containers(None)
-		self.assertEqual(self.audit.containers, before)
-		self.assertEqual(self.audit.stats['last_rescan_method'], 'locked')
-		# 手动 rescan (source != None) -> 强制执行
-		cnt3 = self.audit.rescan_containers(FakeSource())
-		self.assertGreaterEqual(cnt3, 0)
+		# 用带响应的服务器 (确保枚举发现容器)
+		server = FakeServer(self.tmp.name + os.sep + 'cfg2')
+		server.rcon_responses['data get block 4 100 9 id'] = (
+			'4, 100, 9 has the following block data: "minecraft:chest"')
+		server.rcon_responses['data get block 4 100 9 Items'] = (
+			'4, 100, 9 has the following block data: [{Slot: 0b, id: "minecraft:diamond", Count: 5b}]')
+		orig = self.audit.server
+		self.audit.server = server
+		try:
+			# 首次手动枚举 -> 锁定
+			cnt = self.audit.rescan_containers(FakeSource())
+			self.assertGreater(cnt, 0, '应发现 1 个容器')
+			self.assertTrue(self.audit._containers_sealed)
+			# 周期性 rescan (source=None) -> 跳过, 不改变容器
+			before = dict(self.audit.containers)
+			self.audit.rescan_containers(None)
+			self.assertEqual(self.audit.containers, before)
+			self.assertEqual(self.audit.stats['last_rescan_method'], 'locked')
+			# 手动 rescan (source != None) -> 强制执行
+			cnt3 = self.audit.rescan_containers(FakeSource())
+			self.assertGreaterEqual(cnt3, 0)
+			# 大区域防护: 枚举失败 (0 容器) 时不密封
+			self.audit._containers_sealed = False
+			self.audit.containers = {}
+			empty_server = FakeServer(self.tmp.name + os.sep + 'cfg3')
+			self.audit.server = empty_server
+			cnt4 = self.audit.rescan_containers(FakeSource())
+			self.assertEqual(cnt4, 0)
+			self.assertFalse(self.audit._containers_sealed, '0 容器时不密封 (大区域防护)')
+		finally:
+			self.audit.server = orig
 
 	def test_verified_absent_cache(self):
 		"""扫描优化: 已确认非容器坐标缓存, 下次扫描跳过。"""
