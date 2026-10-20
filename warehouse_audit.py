@@ -34,7 +34,7 @@
 
 PLUGIN_METADATA = {
 	'id': 'warehouse_audit',
-	'version': '1.0.3',
+	'version': '1.0.4',
 	'name': '仓库审计日志 (WarehouseAuditLog)',
 	'description': {
 		'en_us': 'Audit warehouse container interactions (player/time/item/count/coords) into SQLite with async batched writes, export CSV via !!wh export',
@@ -1368,7 +1368,10 @@ class WarehouseAudit:
 	def _rcon_scan(self, regions, container_ids):
 		"""逐块 RCON 扫描。返回 (found, verified_absent, unloaded_count)。
 
-		性能优化: 已缓存的非容器坐标 (上次扫描确认) 直接跳过, 不再逐块查询。
+		兼容性: 用 Items 查询发现容器 (轮询同款命令, 已验证跨版本兼容);
+		id 查询在某些版本 (26.x) 输出格式不匹配导致容器全部漏判。
+		发现容器后再补一次 id 查询拿方块类型 (数量少, 双倍查询仅对容器)。
+		性能优化: 已缓存的非容器坐标直接跳过。
 		"""
 		found: Dict[Tuple[int, int, int], str] = {}
 		verified_absent: Set[Tuple[int, int, int]] = set()
@@ -1376,6 +1379,7 @@ class WarehouseAudit:
 		query = self._rcon_query
 		with self._state_lock:
 			cached_absent = set(getattr(self, '_verified_absent', set()) or set())
+		container_candidates: Set[Tuple[int, int, int]] = set()
 		for region in regions:
 			bounds = self._normalize_bounds(region)
 			if not bounds:
@@ -1403,17 +1407,63 @@ class WarehouseAudit:
 						if ERR_NOT_BLOCK_ENTITY in text:
 							verified_absent.add(pos)
 							continue
+						# 兼容性: id 查询的响应在新版本可能不匹配正则;
+						# 用 Items 查询做二次确认 (与轮询相同的兼容路径)
 						m = BLOCK_DATA_RE.match(text) or BLOCK_DATA_RE_LOOSE.match(text)
-						if not m or (int(m.group(1)), int(m.group(2)), int(m.group(3))) != pos:
+						block_id = None
+						if m and (int(m.group(1)), int(m.group(2)), int(m.group(3))) == pos:
+							try:
+								bid = parse_snbt(m.group(4))
+								# 有效性: 方块 id 必须带 minecraft: 命名空间前缀;
+								# 宽松正则可能把新格式截断成无前缀的残片 (如 'chest') -> 视为无法解析
+								if isinstance(bid, str) and bid.startswith('minecraft:'):
+									block_id = bid
+							except SnbtError:
+								block_id = None
+						if block_id is None:
+							# id 响应无法解析 (版本格式差异): 用 Items 查询二次确认
+							resp2 = query('data get block {} {} {} Items'.format(x, y, z))
+							if resp2 is None:
+								unloaded += 1
+								continue
+							t2 = resp2.strip()
+							if ERR_NOT_LOADED in t2:
+								unloaded += 1
+								continue
+							if ERR_NOT_BLOCK_ENTITY in t2:
+								verified_absent.add(pos)
+								continue
+							if ERR_PATH_NOT_FOUND in t2 or 'block data: []' in t2 or 'block data: []' in t2.replace(' ', ''):
+								# 是容器 (空 Items)
+								container_candidates.add(pos)
+								continue
+							# 有物品的容器
+							container_candidates.add(pos)
 							continue
-						try:
-							block_id = parse_snbt(m.group(4))
-						except SnbtError:
-							continue
-						if isinstance(block_id, str) and block_id in container_ids:
+						if block_id in container_ids:
 							found[pos] = block_id
 						else:
 							verified_absent.add(pos)
+		# 对 Items 查询确认的容器补 id 查询拿方块类型
+		for pos in container_candidates:
+			if self._stop_event.is_set():
+				break
+			resp = query('data get block {} {} {} id'.format(*pos))
+			block_id = None
+			if resp:
+				text = resp.strip()
+				m = BLOCK_DATA_RE.match(text) or BLOCK_DATA_RE_LOOSE.match(text)
+				if m and (int(m.group(1)), int(m.group(2)), int(m.group(3))) == pos:
+					try:
+						bid = parse_snbt(m.group(4))
+						if isinstance(bid, str):
+							block_id = bid
+					except SnbtError:
+						block_id = None
+			if block_id is None:
+				# id 查询也拿不到类型: 默认 chest (轮询时 Items 查询不依赖类型)
+				block_id = 'minecraft:chest'
+			found[pos] = block_id
 		return found, verified_absent, unloaded
 
 	def _region_file_scan(self, regions, container_ids) -> Dict[Tuple[int, int, int], str]:
@@ -1862,6 +1912,8 @@ def show_help(source: CommandSource) -> None:
 				'--item 物品ID | --container X,Y,Z | --limit 行数 | --out 路径§r')
 	source.reply('§f{} rescan§r §7- 立即重新枚举容器§r'.format(COMMAND_PREFIX))
 	source.reply('§f{} on / off§r §7- 恢复/暂停轮询§r'.format(COMMAND_PREFIX))
+	source.reply('§f{} anon§r §7- 切换匿名模式 (数字编号代替玩家 ID)§r'.format(COMMAND_PREFIX))
+	source.reply('§f{} anon on / off§r §7- 显式开启/关闭匿名模式§r'.format(COMMAND_PREFIX))
 	source.reply('§f{} region§r §7- 查看监控区域§r'.format(COMMAND_PREFIX))
 	source.reply('§f{} region set <名称> <维度> <x1> <y1> <z1> <x2> <y2> <z2>§r §7- 添加/更新监控区域§r'.format(COMMAND_PREFIX))
 	source.reply('§7  维度: overworld / the_nether / the_end; 例: !!wh region set 主仓库 overworld -10 99 -10 10 101 10§r')
@@ -1922,6 +1974,40 @@ def set_enabled(source: CommandSource, value: bool) -> None:
 	audit.config['enabled'] = value
 	audit.server.save_config_simple(audit.config, file_name='warehouse_audit.json')
 	source.reply('§a轮询已{}§r'.format('恢复' if value else '暂停'))
+
+
+def toggle_anon(source: CommandSource) -> None:
+	"""切换匿名模式开关 (保存配置, 立即生效)。"""
+	if audit is None:
+		source.reply('§c插件未初始化§r')
+		return
+	new_value = not bool(audit.config.get('anonymous_mode', False))
+	audit.config['anonymous_mode'] = new_value
+	audit.server.save_config_simple(audit.config, file_name='warehouse_audit.json')
+	if new_value:
+		source.reply('§a匿名模式已开启§r §7- 数据输出用数字编号 (P1/P2...) 代替玩家 ID§r')
+		with audit._state_lock:
+			ids = dict(audit._anon_ids)
+		if ids:
+			# 显示当前映射 (管理员对照用)
+			pairs = ', '.join('{}={}'.format(k, v) for k, v in sorted(ids.items(), key=lambda kv: kv[1]))
+			source.reply('§7编号映射: {}§r'.format(pairs))
+		else:
+			source.reply('§7编号按玩家首次归因顺序分配§r')
+	else:
+		source.reply('§a匿名模式已关闭§r §7- 数据输出显示真实玩家 ID (之后的新记录)§r')
+
+
+def set_anon(source: CommandSource, value: bool) -> None:
+	"""显式设置匿名模式 (on/off)。"""
+	if audit is None:
+		source.reply('§c插件未初始化§r')
+		return
+	current = bool(audit.config.get('anonymous_mode', False))
+	if current == value:
+		source.reply('§7匿名模式已是{}§r'.format('开启' if value else '关闭'))
+		return
+	toggle_anon(source)
 
 
 # ------------------------------------------------- 区域配置 (!!wh region)
@@ -2054,6 +2140,17 @@ def register(server: PluginServerInterface) -> None:
 		.requires(_require_perm(2), lambda: '权限不足')
 		.runs(lambda src: set_enabled(src, False))
 	)
+	anon_node = Literal('anon').requires(_require_perm(2), lambda: '权限不足')
+	anon_node.runs(toggle_anon)
+	anon_node.then(
+		Literal('on')
+		.runs(lambda src: set_anon(src, True))
+	)
+	anon_node.then(
+		Literal('off')
+		.runs(lambda src: set_anon(src, False))
+	)
+	root.then(anon_node)
 	region_node = Literal('region').requires(_require_perm(2), lambda: '权限不足')
 	region_node.runs(show_regions)
 	# 注意: MCDR 指令树中连续参数必须链式嵌套 (每个参数是前一个的子节点),
