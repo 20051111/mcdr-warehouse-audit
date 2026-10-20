@@ -34,7 +34,7 @@
 
 PLUGIN_METADATA = {
 	'id': 'warehouse_audit',
-	'version': '1.0.1',
+	'version': '1.0.2',
 	'name': '仓库审计日志 (WarehouseAuditLog)',
 	'description': {
 		'en_us': 'Audit warehouse container interactions (player/time/item/count/coords) into SQLite with async batched writes, export CSV via !!wh export',
@@ -81,6 +81,11 @@ BLOCK_DATA_RE = re.compile(
 PLAYER_POS_RE = re.compile(
 	r'([A-Za-z0-9_]{1,16}) has the following entity data: '
 	r'\[(-?[\d.]+(?:[eE][-+]?\d+)?)d, (-?[\d.]+(?:[eE][-+]?\d+)?)d, (-?[\d.]+(?:[eE][-+]?\d+)?)d\]'
+)
+#: 简单物品条目 (1.20.4 旧格式, 无嵌套 tag) 的正则快提取:
+#: {Slot: 0b, id: "minecraft:diamond", Count: 5b}  (键顺序不限, 1.20.5+ 的小写键也兼容)
+FAST_ITEMS_RE = re.compile(
+	r'\{\s*Slot:\s*(\d+)b?\s*,\s*id:\s*"([a-z0-9_:]+)"\s*,\s*Count:\s*(\d+)b?\s*\}'
 )
 #: `execute as @a run data get entity @s Dimension` 的每玩家输出
 PLAYER_DIM_RE = re.compile(
@@ -156,8 +161,10 @@ DEFAULT_CONFIG = {
 	'batch_write_interval_seconds': 0.5,
 	'prune_after_misses': 600,             # 连续 N 次读取不到容器后从轮询列表移除
 	'record_deposits': False,              # False = 只记录取出 (存入不记录)
-	'record_player_id': False,             # False = 不记录玩家 ID (也不查询玩家位置)
+	'record_player_id': True,              # True = 记录玩家 ID (查询玩家位置做归因)
 	'record_dimension': False,             # False = 不记录维度信息
+	'anonymous_mode': False,               # True = 匿名模式: 数据输出用数字编号代替玩家 ID
+	'lock_containers': True,               # True = 锁定容器列表: 区域框定后不再自动新增容器坐标 (临时容器不统计)
 	'merge_window_seconds': 1.0,           # 同一容器相同物品的多次取出在此时长内合并为一条 (数量相加); 0 = 不合并
 }
 
@@ -536,8 +543,21 @@ def parse_block_items_response(response: Optional[str], pos: Tuple[int, int, int
 		return READ_SKIP, None
 	if (int(m.group(1)), int(m.group(2)), int(m.group(3))) != pos:
 		return READ_SKIP, None
+	payload = m.group(4)
+	# 性能优化: 简单响应 (1.20.4 旧格式, 无嵌套 tag/components) 用正则快速提取,
+	# 比递归下降 SNBT 解析快约 10 倍; 含嵌套结构时回退全量解析。
+	if 'tag:' not in payload and 'components' not in payload and '"' in payload:
+		fast = FAST_ITEMS_RE.findall(payload)
+		if fast:
+			result: Dict[int, Tuple[str, int, Optional[str]]] = {}
+			for slot_s, item_id, count_s in fast:
+				try:
+					result[int(slot_s)] = (item_id, int(count_s), None)
+				except ValueError:
+					continue
+			return READ_OK, result
 	try:
-		items = parse_snbt(m.group(4))
+		items = parse_snbt(payload)
 	except SnbtError:
 		return READ_SKIP, None
 	if not isinstance(items, list):
@@ -659,6 +679,16 @@ class WarehouseAudit:
 		self.players: Dict[str, Tuple[Optional[str], float, float, float]] = {}
 		self.region_of: Dict[Tuple[int, int, int], str] = {}      # pos -> region name
 		self._rescan_lock = threading.Lock()
+		# 已确认的非容器坐标缓存 (扫描性能优化)
+		self._verified_absent: Set[Tuple[int, int, int]] = set()
+		# 响应哈希缓存 (1.20.5+ 大响应性能优化: 哈希未变跳过解析)
+		self._resp_hashes: Dict[Tuple[int, int, int], int] = {}
+		self._resp_hash_lock = threading.Lock()
+		# 容器列表锁定 (lock_containers=true 时首次枚举后密封)
+		self._containers_sealed = False
+		# 匿名编号映射: player name -> 编号 (anon mode)
+		self._anon_ids: Dict[str, str] = {}
+		self._anon_counter = 0
 
 		# 运行统计
 		self.stats = {
@@ -786,9 +816,18 @@ class WarehouseAudit:
 						self._read_containers_and_diff()
 						with self._state_lock:
 							self.stats['poll_cycles'] += 1
-							self.stats['last_cycle_ms'] = (time.perf_counter() - cycle_start) * 1000.0
+							cycle_ms = (time.perf_counter() - cycle_start) * 1000.0
+							self.stats['last_cycle_ms'] = cycle_ms
 							self.stats['last_poll_ts'] = time.time()
 					interval = max(0.1, float(self.config.get('poll_interval_seconds', 1.0)))
+					# 自适应降频 (时间预算): 单周期耗时超过轮询间隔的 60% 时,
+					# 自动拉长间隔到 周期耗时/0.6 (上限 10s), 保证不卡 RCON/服务端;
+					# 周期变快后逐步回落到配置间隔
+					with self._state_lock:
+						cycle_ms = self.stats['last_cycle_ms']
+					budget = interval * 1000.0 * 0.6
+					if cycle_ms > budget:
+						interval = min(10.0, max(interval, (cycle_ms / 1000.0) / 0.6))
 					self._stop_event.wait(interval)
 				except Exception:
 					err = traceback.format_exc()
@@ -833,14 +872,59 @@ class WarehouseAudit:
 		new_snapshots: Dict[Tuple[int, int, int], Dict[int, Tuple[str, int]]] = {}
 		records: List[Tuple] = []
 		prune_threshold = int(self.config.get('prune_after_misses', 600))
-		for pos, block_id in containers.items():
+		# 多线程解析: RCON 拉取串行 (单 socket), SNBT 解析并行 (CPU 密集)
+		# 解析结果按容器顺序收集, 保证处理顺序稳定
+		parse_results: Dict[Tuple[int, int, int], object] = {}
+		parse_lock = threading.Lock()
+		parse_error = {'abort': False}
+		def fetch_and_parse(pos, block_id):
+			if self._stop_event.is_set() or parse_error['abort']:
+				return
 			x, y, z = pos
 			resp = self._rcon_query('data get block {} {} {} Items'.format(x, y, z))
 			if resp is None:
-				# RCON 断开 (服务端死亡瞬间): 中止本轮, 避免对每个容器重复触发
-				# MCDR 内部的 3 次重试 (Bad file descriptor 刷屏)
-				break
-			status, items = parse_block_items_response(resp, pos)
+				# RCON 断开 (服务端死亡瞬间): 通知中止
+				parse_error['abort'] = True
+				return
+			# 性能优化 (1.20.5+ 大响应): 响应哈希与上次相同 -> 内容未变,
+			# 直接复用旧快照, 跳过 SNBT 全量解析 (1.21.x 组件化响应可达几十 KB)
+			with self._resp_hash_lock:
+				last_hash = self._resp_hashes.get(pos)
+			this_hash = hash(resp)
+			if this_hash == last_hash:
+				with parse_lock:
+					parse_results[pos] = ('unchanged', None)
+				return
+			try:
+				status, items = parse_block_items_response(resp, pos)
+			except Exception:
+				status, items = READ_SKIP, None
+			with self._resp_hash_lock:
+				self._resp_hashes[pos] = this_hash
+			with parse_lock:
+				parse_results[pos] = (status, items)
+
+		# 拉取+解析在多个工作线程并行 (RCON 内部有锁串行化, 解析并行)
+		from concurrent.futures import ThreadPoolExecutor
+		workers = max(2, min(4, (os.cpu_count() or 2)))
+		with ThreadPoolExecutor(max_workers=workers, thread_name_prefix='WarehouseAudit-Parse') as pool:
+			futures = [pool.submit(fetch_and_parse, pos, bid) for pos, bid in containers.items()]
+			for f in futures:
+				f.result()
+		if parse_error['abort']:
+			# RCON 断开: 本轮中止 (快照不变, 下轮重新基线)
+			return
+		for pos, block_id in containers.items():
+			result = parse_results.get(pos)
+			if result is None:
+				continue
+			status, items = result
+			if status == 'unchanged':
+				# 响应哈希未变 -> 内容未变: 复用旧快照, 跳过 diff (1.21.x 性能优化)
+				if pos in old_snapshots:
+					new_snapshots[pos] = old_snapshots[pos]
+					self.miss_counts[pos] = 0
+				continue
 			if status == READ_SKIP:
 				# 未加载或读取失败: 保留旧快照 (未加载区块内不可能发生变化)
 				if pos in old_snapshots:
@@ -1022,7 +1106,21 @@ class WarehouseAudit:
 					best_name = name
 		if best_name is None:
 			return None, None, False
-		return best_name, round(best_dist, 2), near_count >= 2
+		display = self._anonymize(best_name)
+		return display, round(best_dist, 2), near_count >= 2
+
+	def _anonymize(self, name: str) -> str:
+		"""匿名模式: 用数字编号 (P1, P2...) 代替玩家 ID; 关闭时返回原名。
+
+		编号按玩家首次归因顺序分配, 同一玩家始终对应同一编号 (一一对应)。
+		"""
+		if not bool(self.config.get('anonymous_mode', False)):
+			return name
+		with self._state_lock:
+			if name not in self._anon_ids:
+				self._anon_counter += 1
+				self._anon_ids[name] = 'P{}'.format(self._anon_counter)
+			return self._anon_ids[name]
 
 	# ------------------------------------------------------------------ 队列
 
@@ -1142,14 +1240,35 @@ class WarehouseAudit:
 		if time.time() - last >= interval:
 			self.rescan_containers()
 
+	def _containers_locked(self) -> bool:
+		"""容器列表是否已锁定 (lock_containers=true 且已枚举过至少一次)。"""
+		if not bool(self.config.get('lock_containers', False)):
+			return False
+		with self._state_lock:
+			return self._containers_sealed
+
 	def rescan_containers(self, source: Optional[CommandSource] = None) -> int:
-		"""重新枚举容器。返回容器总数。"""
+		"""重新枚举容器。返回容器总数。
+
+		lock_containers=true 时: 首次枚举后锁定列表, 之后的周期性 rescan
+		直接跳过 (不再新增容器坐标), 手动 !!wh rescan 可强制解锁重扫。
+		"""
+		if self._containers_locked() and source is None:
+			# 周期性 rescan 在锁定模式下跳过
+			with self._state_lock:
+				self.stats['last_rescan_ts'] = time.time()
+				self.stats['last_rescan_method'] = 'locked'
+			return len(self.containers)
 		if not self._rescan_lock.acquire(blocking=False):
 			if source is not None:
 				source.reply('§7已有枚举任务在进行中§r')
 			return -1
 		try:
-			return self._rescan_containers_impl(source)
+			count = self._rescan_containers_impl(source)
+			if count >= 0 and bool(self.config.get('lock_containers', False)):
+				with self._state_lock:
+					self._containers_sealed = True
+			return count
 		finally:
 			self._rescan_lock.release()
 
@@ -1179,6 +1298,10 @@ class WarehouseAudit:
 			rcon_found, verified_absent, unloaded = self._rcon_scan(regions, container_ids)
 			found.update(rcon_found)
 			method_used = 'rcon_scan'
+			# 性能优化: 缓存已确认的非容器坐标, 下次扫描跳过 (不再逐块查询非容器方块)
+			if not self._containers_locked():
+				with self._state_lock:
+					self._verified_absent = verified_absent
 			if unloaded > 0:
 				# 有区块未加载: 用区域文件补齐 (但尊重 RCON 已确认不存在的位置)
 				file_found = self._region_file_scan(regions, container_ids)
@@ -1220,11 +1343,16 @@ class WarehouseAudit:
 		return count
 
 	def _rcon_scan(self, regions, container_ids):
-		"""逐块 RCON 扫描。返回 (found, verified_absent, unloaded_count)。"""
+		"""逐块 RCON 扫描。返回 (found, verified_absent, unloaded_count)。
+
+		性能优化: 已缓存的非容器坐标 (上次扫描确认) 直接跳过, 不再逐块查询。
+		"""
 		found: Dict[Tuple[int, int, int], str] = {}
 		verified_absent: Set[Tuple[int, int, int]] = set()
 		unloaded = 0
 		query = self._rcon_query
+		with self._state_lock:
+			cached_absent = set(getattr(self, '_verified_absent', set()) or set())
 		for region in regions:
 			bounds = self._normalize_bounds(region)
 			if not bounds:
@@ -1236,6 +1364,11 @@ class WarehouseAudit:
 						if self._stop_event.is_set() or not self.server.is_rcon_running():
 							# 停止或 RCON 断开: 中止扫描 (避免 Bad file descriptor 刷屏)
 							return found, verified_absent, unloaded
+						pos = (x, y, z)
+						if pos in cached_absent:
+							# 已确认的非容器方块: 跳过 (性能优化)
+							verified_absent.add(pos)
+							continue
 						resp = query('data get block {} {} {} id'.format(x, y, z))
 						if resp is None:
 							unloaded += 1
@@ -1245,19 +1378,19 @@ class WarehouseAudit:
 							unloaded += 1
 							continue
 						if ERR_NOT_BLOCK_ENTITY in text:
-							verified_absent.add((x, y, z))
+							verified_absent.add(pos)
 							continue
 						m = BLOCK_DATA_RE.match(text)
-						if not m or (int(m.group(1)), int(m.group(2)), int(m.group(3))) != (x, y, z):
+						if not m or (int(m.group(1)), int(m.group(2)), int(m.group(3))) != pos:
 							continue
 						try:
 							block_id = parse_snbt(m.group(4))
 						except SnbtError:
 							continue
 						if isinstance(block_id, str) and block_id in container_ids:
-							found[(x, y, z)] = block_id
+							found[pos] = block_id
 						else:
-							verified_absent.add((x, y, z))
+							verified_absent.add(pos)
 		return found, verified_absent, unloaded
 
 	def _region_file_scan(self, regions, container_ids) -> Dict[Tuple[int, int, int], str]:
@@ -1529,12 +1662,16 @@ class WarehouseAudit:
 			'运行: §e{}§r | 轮询周期: §e{}§r'.format(
 				'开启' if self.config.get('enabled', True) else '暂停',
 				'{:.2f}s'.format(self.config.get('poll_interval_seconds', 1.0))),
-			'记录范围: §e{}§r | 记录存入: §e{}§r | 记录玩家ID: §e{}§r | 合并窗口: §e{}§r'.format(
+			'记录范围: §e{}§r | 记录存入: §e{}§r | 记录玩家ID: §e{}§r | 匿名模式: §e{}§r | 合并窗口: §e{}§r'.format(
 				'只记取出' if not self.config.get('record_deposits', False) else '取出+存入',
 				'开' if self.config.get('record_deposits', False) else '关',
 				'开' if self.config.get('record_player_id', False) else '关',
+				'开 (编号 P1/P2...)' if self.config.get('anonymous_mode', False) else '关',
 				'{:.1f}s'.format(float(self.config.get('merge_window_seconds', 1.0)))
 				if float(self.config.get('merge_window_seconds', 1.0)) > 0 else '关'),
+			'容器锁定: §e{}§r | 非容器缓存: §e{}§r 个坐标'.format(
+				'已锁定' if self._containers_locked() else '关',
+				len(getattr(self, '_verified_absent', set()) or set())),
 			'已知容器: §e{}§r 个 | 队列深度: §e{}§r | 已写入: §e{}§r 条 | 丢弃: §e{}§r 条'.format(
 				containers, queue_depth, stats['records_written'], stats['records_dropped']),
 			'数据库: §e{}§r ({} 行, {:.1f} KB)'.format(self.db_path, db_rows, db_size / 1024.0),

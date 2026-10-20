@@ -57,8 +57,10 @@ MCDR 会自动加载（若安装了 AutoPluginReloader，约 10 秒内生效；�
   "batch_write_interval_seconds": 0.5,
   "prune_after_misses": 600,
   "record_deposits": false,
-  "record_player_id": false,
+  "record_player_id": true,
   "record_dimension": false,
+  "anonymous_mode": false,
+  "lock_containers": true,
   "merge_window_seconds": 1.0
 }
 ```
@@ -67,14 +69,16 @@ MCDR 会自动加载（若安装了 AutoPluginReloader，约 10 秒内生效；�
 | --- | --- |
 | `regions` | 监控区域列表，支持多区域；`dimension` 为 `minecraft:overworld` / `minecraft:the_nether` / `minecraft:the_end`；`from`/`to` 为对角坐标（顺序任意） |
 | `container_blocks` | 监控的容器方块 ID（默认含箱子/陷阱箱/木桶/潜影盒 17 色） |
-| `poll_interval_seconds` | 轮询间隔；间隔内"取出又放回"的净零变化不会记录 |
+| `poll_interval_seconds` | 轮询间隔；间隔内"取出又放回"的净零变化不会记录；单周期超时自动降频（不卡服） |
 | `enumeration_method` | `auto`（小区域 RCON 逐块扫描，大区域解析区域文件）/ `rcon_scan` / `region_file` |
 | `attribution_radius` | 玩家归因半径（格）；仅 `record_player_id=true` 时生效 |
 | `world_directory` | 世界目录（`world` 文件夹），留空自动推断 |
 | `prune_after_misses` | 容器连续 N 次读取不到后从轮询列表移除 |
 | `record_deposits` | `false`=只记录取出（默认）；`true`=存入也记录 |
-| `record_player_id` | `false`=不记录玩家 ID 且不查询玩家位置（默认）；`true`=启用最近玩家归因 |
+| `record_player_id` | `true`=记录玩家 ID 并归因最近玩家（**默认**）；`false`=不记录也不查询 |
 | `record_dimension` | `false`=不记录维度（默认）；`true`=CSV 增加"维度"列 |
+| `anonymous_mode` | `false`=显示真实玩家 ID（默认）；`true`=用数字编号（P1/P2...）代替，一一对应但匿名 |
+| `lock_containers` | `true`=首次枚举后锁定容器列表，**区域框定后不再自动新增容器坐标（临时容器不统计）**（默认）；`false`=周期性 rescan 自动纳入新容器 |
 | `merge_window_seconds` | 同一容器相同物品的多次取出在此时长内合并为一条、数量相加（默认 1.0；0=不合并） |
 
 修改配置后需重载插件：`!!MCDR plugin reload warehouse_audit`（或重启 MCDR）。

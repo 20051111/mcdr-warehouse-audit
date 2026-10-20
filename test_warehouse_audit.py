@@ -656,6 +656,72 @@ class TestLifecycle(unittest.TestCase):
 		finally:
 			self.audit.server = orig
 
+	def test_anonymous_mode(self):
+		"""匿名模式: 数字编号 P1/P2... 代替玩家 ID, 同一玩家同一编号。"""
+		self.audit.config['anonymous_mode'] = True
+		self.assertEqual(self.audit._anonymize('Steve'), 'P1')
+		self.assertEqual(self.audit._anonymize('Alex'), 'P2')
+		# 同一玩家始终同一编号 (一一对应)
+		self.assertEqual(self.audit._anonymize('Steve'), 'P1')
+		self.assertEqual(self.audit._anonymize('Alex'), 'P2')
+		self.assertNotEqual(self.audit._anonymize('Steve'), self.audit._anonymize('Alex'))
+
+	def test_anonymous_mode_off(self):
+		"""匿名模式关闭: 返回真实玩家 ID。"""
+		self.audit.config['anonymous_mode'] = False
+		self.assertEqual(self.audit._anonymize('Steve'), 'Steve')
+
+	def test_record_player_id_default_on(self):
+		"""玩家 ID 默认开启。"""
+		self.assertTrue(wa.DEFAULT_CONFIG.get('record_player_id'))
+
+	def test_lock_containers(self):
+		"""容器锁定: 首次枚举后周期性 rescan 跳过, 手动 rescan (带 source) 仍可强制。"""
+		self.audit.config['lock_containers'] = True
+		# 首次手动枚举 -> 锁定
+		cnt = self.audit.rescan_containers(FakeSource())
+		self.assertGreaterEqual(cnt, 0)
+		self.assertTrue(self.audit._containers_sealed)
+		# 周期性 rescan (source=None) -> 跳过, 不改变容器
+		before = dict(self.audit.containers)
+		self.audit.rescan_containers(None)
+		self.assertEqual(self.audit.containers, before)
+		self.assertEqual(self.audit.stats['last_rescan_method'], 'locked')
+		# 手动 rescan (source != None) -> 强制执行
+		cnt3 = self.audit.rescan_containers(FakeSource())
+		self.assertGreaterEqual(cnt3, 0)
+
+	def test_verified_absent_cache(self):
+		"""扫描优化: 已确认非容器坐标缓存, 下次扫描跳过。"""
+		# FakeServer 的 rcon_query 对 id 查询返回 None (= 未加载), 不产生缓存
+		# 构造一个模拟服务端: 区域内 1 个容器 + 其余全为非容器方块
+		server = FakeServer(self.tmp.name + os.sep + 'cfg')
+		# 主仓库区域 (-10,99,-10)~(10,101,10); 在 (4,100,9) 放一个箱子
+		total_volume = 21 * 3 * 21
+		server.rcon_responses['data get block 4 100 9 id'] = (
+			'4, 100, 9 has the following block data: "minecraft:chest"')
+		for x in range(-10, 11):
+			for y in (99, 100, 101):
+				for z in range(-10, 11):
+					if (x, y, z) != (4, 100, 9):
+						server.rcon_responses['data get block {} {} {} id'.format(x, y, z)] = (
+							'The target block is not a block entity')
+		self.audit.server = server
+		self.audit.rescan_containers(FakeSource())
+		cached = set(self.audit._verified_absent)
+		self.assertEqual(len(self.audit.containers), 1, '应发现 1 个容器')
+		self.assertEqual(len(cached), total_volume - 1, '缓存 = 总块数 - 容器数')
+		# 第二次扫描: 结果一致且命中缓存
+		queries_before = len(server.rcon_log)
+		self.audit.rescan_containers(FakeSource())
+		queries_after = len(server.rcon_log)
+		self.assertEqual(len(self.audit.containers), 1)
+		# 第二次扫描所有 id 查询都命中缓存 -> rcon_log 只增长极少量 (0 次 id 查询)
+		id_queries = sum(1 for c in server.rcon_log[queries_before:] if c.endswith(' id'))
+		self.assertEqual(id_queries, 1, '仅容器坐标需查询 (1322 个非容器全部命中缓存)')
+		# 恢复原 server
+		self.audit.server = self.server
+
 	def test_rebaseline_flushes_and_clears(self):
 		# 挂起记录 + 旧快照
 		rec = ('t', 1000.0, '主仓库', 'minecraft:overworld', 4, 100, 9,
@@ -882,6 +948,8 @@ class TestExport(unittest.TestCase):
 		self.tmp.cleanup()
 
 	def test_export_all(self):
+		# 默认 record_player_id=True -> 显式关闭以测最小列
+		self.audit.config['record_player_id'] = False
 		out = os.path.join(self.tmp.name, 'all.csv')
 		count, span_from, span_to = self.audit._write_csv(self.audit._parse_export_args(''), out)
 		self.assertEqual(count, 50)
@@ -918,6 +986,7 @@ class TestExport(unittest.TestCase):
 
 	def test_export_with_dimension_column(self):
 		self.audit.config['record_dimension'] = True
+		self.audit.config['record_player_id'] = False  # 只测维度列
 		out = os.path.join(self.tmp.name, 'd.csv')
 		self.audit._write_csv(self.audit._parse_export_args(''), out)
 		with open(out, encoding='utf-8-sig') as f:
@@ -1198,7 +1267,7 @@ class TestPollCycle(unittest.TestCase):
 		self.assertEqual(sum(r[1] for r in rows), -5)
 
 	def test_default_mode_take_only_no_player(self):
-		"""默认配置 (record_deposits=False, record_player_id=False): 只记取出, 不查玩家。"""
+		"""默认配置 (record_deposits=False): 只记取出; 玩家ID默认开启。"""
 		tmp = tempfile.TemporaryDirectory()
 		self.addCleanup(tmp.cleanup)
 		server = FakeChestServer(os.path.join(tmp.name, 'config', 'warehouse_audit'))
@@ -1206,7 +1275,9 @@ class TestPollCycle(unittest.TestCase):
 		self.addCleanup(audit.stop)
 		audit.load_config()
 		self.assertFalse(audit.config['record_deposits'])
-		self.assertFalse(audit.config['record_player_id'])
+		self.assertTrue(audit.config['record_player_id'], '玩家 ID 默认开启')
+		# 本测试验证"无玩家时"的行为 - 显式关闭玩家记录
+		audit.config['record_player_id'] = False
 		audit.db_path = os.path.join(tmp.name, 'test.db')
 		audit.containers = {(4, 100, 9): 'minecraft:chest'}
 		audit.region_of = {(4, 100, 9): '主仓库'}
